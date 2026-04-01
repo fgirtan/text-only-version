@@ -1,0 +1,2 @@
+# Acest fișier este intenționat lăsat gol.
+# Rolul lui este de a spune platformelor de hosting (precum Render) să treacă cu succes de secvența de "build", fără să caute dependențe adiționale.
