@@ -587,6 +587,10 @@
                     🌐 Fetch & Convert
                 </button>
             </div>
+            <label class="toggle" style="color:#8b949e" id="render-toggle-label">
+                <input type="checkbox" id="render-toggle" checked disabled>
+                <span id="render-toggle-text">Randează și cu JavaScript (Chromium headless) și compară automat</span>
+            </label>
             <div id="status-msg" class="status-msg">
                 <span class="loader"></span>
                 <span id="status-text">Se descarcă HTML-ul...</span>
@@ -615,7 +619,8 @@
         <details class="compare-section" id="compare-section">
             <summary>🔬 Compară cu DOM-ul randat (testul decisiv)</summary>
             <ol>
-                <li>Cel mai fidel: Google Search Console → URL Inspection → <em>Test live URL</em> → <em>View tested page</em> → tab HTML → copiază tot.</li>
+                <li>Automat: bifează „Randează și cu JavaScript” de sus — serverul încarcă pagina în Chromium și completează câmpul de mai jos.</li>
+                <li>Cel mai fidel față de Google: Google Search Console → URL Inspection → <em>Test live URL</em> → <em>View tested page</em> → tab HTML → copiază tot.</li>
                 <li>Alternativ: deschide pagina în Chrome → DevTools (F12) → Elements → click dreapta pe <code>&lt;html&gt;</code> → Copy → <em>Copy outerHTML</em>.</li>
                 <li>Lipește mai jos și apasă „Compară”. HTML-ul brut de sus este comparat cu cel randat după JavaScript.</li>
             </ol>
@@ -665,6 +670,8 @@
 
     // Metadata of the last fetched URL; null when the HTML was pasted by hand.
     let lastFetch = null;
+    // Metadata of the last server-side Chromium render; null when the rendered HTML was pasted.
+    let lastRender = null;
     // Base URL used to resolve relative links in the current document.
     let currentBase = null;
     let statusTimer = null;
@@ -692,25 +699,40 @@
             fetchBtn.innerHTML = '⌛ Se încarcă...';
             updateStatus('Se descarcă HTML-ul brut (fără JavaScript)...');
 
-            const response = await fetch(`/proxy?url=${encodeURIComponent(url)}&ua=${encodeURIComponent(ua)}`);
-            let data;
-            try {
-                data = await response.json();
-            } catch (e) {
-                throw new Error(`Răspuns invalid de la proxy (${response.status}). Asigură-te că rulezi 'run-viewer.py'.`);
-            }
-            if (!data.ok) {
-                throw new Error(data.error || `Eroare la descărcare (${response.status}).`);
-            }
+            const query = `url=${encodeURIComponent(url)}&ua=${encodeURIComponent(ua)}`;
+            const toggle = document.getElementById('render-toggle');
+            const wantRender = !toggle.disabled && toggle.checked;
+            // Start the (slower) Chromium render right away, in parallel with the raw fetch.
+            const renderPromise = wantRender ? getJSON(`/render?${query}`, 'randare') : null;
+            renderPromise?.catch(() => {});
 
+            const data = await getJSON(`/proxy?${query}`, 'descărcare');
             document.getElementById('html-input').value = data.html;
+            document.getElementById('rendered-input').value = '';
             lastFetch = data;
-
-            updateStatus(`HTML descărcat (HTTP ${data.status}, ${formatBytes(data.bytes)}).`, data.status >= 400 ? 'error' : 'success');
+            lastRender = null;
             convert();
 
+            if (renderPromise) {
+                updateStatus(`HTML brut descărcat (HTTP ${data.status}). Se randează pagina în Chromium (poate dura 10–40 s)...`);
+                fetchBtn.innerHTML = '⌛ Se randează...';
+                try {
+                    const rendered = await renderPromise;
+                    document.getElementById('rendered-input').value = rendered.html;
+                    lastRender = rendered;
+                    document.getElementById('compare-section').open = true;
+                    compareRendered();
+                    updateStatus(`Gata: HTML brut (HTTP ${data.status}) și randat (${(rendered.elapsed_ms / 1000).toFixed(1)} s) comparate.`, 'success');
+                } catch (e) {
+                    updateStatus(`HTML brut analizat, dar randarea a eșuat: ${e.message}`, 'error');
+                    return;
+                }
+            } else {
+                updateStatus(`HTML descărcat (HTTP ${data.status}, ${formatBytes(data.bytes)}).`, data.status >= 400 ? 'error' : 'success');
+            }
+
             clearTimeout(statusTimer);
-            statusTimer = setTimeout(() => updateStatus(''), 4000);
+            statusTimer = setTimeout(() => updateStatus(''), 6000);
         } catch (error) {
             console.error(error);
             clearTimeout(statusTimer);
@@ -718,6 +740,34 @@
         } finally {
             fetchBtn.disabled = false;
             fetchBtn.innerHTML = originalText;
+        }
+    }
+
+    async function getJSON(path, label) {
+        const response = await fetch(path);
+        let data;
+        try {
+            data = await response.json();
+        } catch (e) {
+            throw new Error(`Răspuns invalid de la server la ${label} (${response.status}).`);
+        }
+        if (!data.ok) throw new Error(data.error || `Eroare la ${label} (${response.status}).`);
+        return data;
+    }
+
+    async function loadCapabilities() {
+        const toggle = document.getElementById('render-toggle');
+        const text = document.getElementById('render-toggle-text');
+        try {
+            const caps = await (await fetch('/capabilities')).json();
+            toggle.disabled = !caps.render;
+            if (!caps.render) {
+                toggle.checked = false;
+                text.textContent = `Randare Chromium indisponibilă: ${caps.reason} Poți lipi manual HTML-ul randat mai jos.`;
+            }
+        } catch (e) {
+            toggle.checked = false;
+            text.textContent = 'Randare Chromium indisponibilă (serverul nu răspunde).';
         }
     }
 
@@ -1053,8 +1103,18 @@
             ? `<ul class="missing-list">${items.slice(0, max).map(fmt).join('')}${items.length > max ? `<li class="muted">… și încă ${items.length - max}</li>` : ''}</ul>`
             : '<p class="muted" style="margin:6px 0 14px">Nimic.</p>';
 
+        const r = lastRender;
+        const renderInfo = r
+            ? `<p class="muted" style="margin:-6px 0 12px">Randat automat în Chromium headless (${escapeHtml(document.getElementById('ua-select').selectedOptions[0].text)}):
+                HTTP ${r.status ?? '—'} · ${(r.elapsed_ms / 1000).toFixed(1)} s · ${r.requests} requesturi (${r.skipped} imagini/fonturi omise, ${r.blocked} blocate, ${r.failed} eșuate)
+                ${r.network_idle_timeout ? ' · ⚠️ rețeaua nu s-a liniștit în timpul alocat — o parte din conținut poate lipsi și din randare' : ''}
+                ${r.console_errors?.length ? ` · ${r.console_errors.length} erori JavaScript în consolă` : ''}</p>
+               ${r.console_errors?.length ? `<ul class="missing-list">${r.console_errors.map(e => `<li class="muted">${escapeHtml(e)}</li>`).join('')}</ul>` : ''}`
+            : '<p class="muted" style="margin:-6px 0 12px">HTML randat lipit manual.</p>';
+
         panel.innerHTML = `
             <h2>🔬 HTML brut vs. DOM randat</h2>
+            ${renderInfo}
             <div class="verdict ${level}">${escapeHtml(title)}
                 <small>${matched.toLocaleString()} din ${renderedWords.length.toLocaleString()} cuvinte randate se regăsesc în sursa serverului · ${missingHeadings.length} headinguri, ${missingText.length} blocuri de text și ${missingLinks.length} linkuri apar doar după JavaScript.</small>
             </div>
@@ -1525,6 +1585,7 @@
      */
     function clearAll() {
         lastFetch = null;
+        lastRender = null;
         currentBase = null;
         document.getElementById('html-input').value = '';
         document.getElementById('rendered-input').value = '';
@@ -1622,6 +1683,8 @@
 
     // Hand-pasted HTML no longer belongs to the last fetched URL.
     document.getElementById('html-input').addEventListener('input', () => { lastFetch = null; });
+    document.getElementById('rendered-input').addEventListener('input', () => { lastRender = null; });
+    loadCapabilities();
 
     // Allow Ctrl+Enter to convert
     document.getElementById('html-input').addEventListener('keydown', function(e) {
