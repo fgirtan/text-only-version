@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: text-only-viewer
+    runtime: docker
+    plan: free
+    healthCheckPath: /
