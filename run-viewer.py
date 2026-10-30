@@ -248,6 +248,7 @@ def fetch(url, ua_key):
 
 RENDER_TIMEOUT = 30          # seconds for the whole navigation
 NETWORK_IDLE_TIMEOUT = 8     # extra wait for XHR/fetch content after "load"
+DOM_STABLE_TIMEOUT = 6       # if the network never goes idle, wait at most this long for the text to settle
 RENDER_QUEUE_TIMEOUT = 60    # how long a request waits for a free browser slot
 # One Chromium at a time: the free Render instance has 512 MB RAM.
 RENDER_SLOTS = threading.Semaphore(int(os.environ.get('RENDER_CONCURRENCY', '1')))
@@ -283,6 +284,23 @@ class RenderBusy(Exception):
     pass
 
 
+def wait_for_stable_text(page, timeout):
+    """Poll the body text length until it stays the same for 1.5 s. Returns False on timeout."""
+    deadline = time.time() + timeout
+    last, unchanged = None, 0
+    while time.time() < deadline:
+        try:
+            length = page.evaluate('document.body ? document.body.innerText.length : 0')
+        except Exception:
+            return False
+        unchanged = unchanged + 1 if length == last else 0
+        if unchanged >= 3:
+            return True
+        last = length
+        page.wait_for_timeout(500)
+    return False
+
+
 def render(url, ua_key):
     """Load the page in headless Chromium, run its JavaScript and return the rendered DOM."""
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -291,6 +309,7 @@ def render(url, ua_key):
     ua = USER_AGENTS.get(ua_key, USER_AGENTS['chrome'])
     stats = {'requests': 0, 'skipped': 0, 'blocked': 0, 'failed': 0}
     console_errors = []
+    failed_requests = []
     host_ok = {}
 
     def allowed(request_url):
@@ -310,7 +329,8 @@ def render(url, ua_key):
         stats['requests'] += 1
         if request.resource_type in SKIPPED_RESOURCES:
             stats['skipped'] += 1
-            return route.abort()
+            # 'blockedbyclient' tells our own skips apart from real failures in the events below.
+            return route.abort('blockedbyclient')
         if not request.url.startswith(('http://', 'https://')) or not allowed(request.url):
             stats['blocked'] += 1
             return route.abort('blockedbyclient')
@@ -336,17 +356,35 @@ def render(url, ua_key):
                 )
                 page = context.new_page()
                 page.route('**/*', handle)
-                page.on('requestfailed', lambda r: r.failure != 'net::ERR_BLOCKED_BY_CLIENT' and r.resource_type not in SKIPPED_RESOURCES and stats.update(failed=stats['failed'] + 1))
-                page.on('console', lambda m: m.type == 'error' and len(console_errors) < 10 and console_errors.append(m.text[:300]))
+                def on_request_failed(request):
+                    if 'ERR_BLOCKED_BY_CLIENT' in (request.failure or ''):
+                        return
+                    stats['failed'] += 1
+                    if len(failed_requests) < 15:
+                        failed_requests.append({'url': request.url[:300], 'type': request.resource_type, 'error': request.failure})
+
+                def on_console(message):
+                    # "Failed to load resource" duplicates requestfailed; our own skips are not errors.
+                    if message.type != 'error' or 'Failed to load resource' in message.text or len(console_errors) >= 10:
+                        return
+                    console_errors.append(message.text[:300])
+
+                page.on('requestfailed', on_request_failed)
+                page.on('console', on_console)
                 page.on('pageerror', lambda e: len(console_errors) < 10 and console_errors.append(str(e)[:300]))
 
                 response = page.goto(url, wait_until='domcontentloaded', timeout=RENDER_TIMEOUT * 1000)
                 timed_out = False
+                dom_stable = True
                 for state, timeout in (('load', RENDER_TIMEOUT), ('networkidle', NETWORK_IDLE_TIMEOUT)):
                     try:
                         page.wait_for_load_state(state, timeout=timeout * 1000)
                     except PlaywrightTimeout:
                         timed_out = True
+                if timed_out:
+                    # Analytics, chat widgets or long polling keep the network busy forever;
+                    # what matters is whether the visible text has stopped changing.
+                    dom_stable = wait_for_stable_text(page, DOM_STABLE_TIMEOUT)
                 html = page.content()
                 return {
                     'ok': True,
@@ -356,7 +394,9 @@ def render(url, ua_key):
                     'bytes': len(html.encode('utf-8')),
                     'elapsed_ms': int((time.time() - started) * 1000),
                     'network_idle_timeout': timed_out,
+                    'dom_stable': dom_stable,
                     'console_errors': console_errors,
+                    'failed_requests': failed_requests,
                     'user_agent': ua,
                     **stats,
                 }

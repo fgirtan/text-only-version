@@ -1107,9 +1107,12 @@
         const renderInfo = r
             ? `<p class="muted" style="margin:-6px 0 12px">Randat automat în Chromium headless (${escapeHtml(document.getElementById('ua-select').selectedOptions[0].text)}):
                 HTTP ${r.status ?? '—'} · ${(r.elapsed_ms / 1000).toFixed(1)} s · ${r.requests} requesturi (${r.skipped} imagini/fonturi omise, ${r.blocked} blocate, ${r.failed} eșuate)
-                ${r.network_idle_timeout ? ' · ⚠️ rețeaua nu s-a liniștit în timpul alocat — o parte din conținut poate lipsi și din randare' : ''}
-                ${r.console_errors?.length ? ` · ${r.console_errors.length} erori JavaScript în consolă` : ''}</p>
-               ${r.console_errors?.length ? `<ul class="missing-list">${r.console_errors.map(e => `<li class="muted">${escapeHtml(e)}</li>`).join('')}</ul>` : ''}`
+                ${r.network_idle_timeout && r.dom_stable === false ? ' · ⚠️ pagina încă se modifica la final — o parte din conținut poate lipsi și din randare' : ''}
+                ${r.network_idle_timeout && r.dom_stable !== false ? ' · rețeaua a rămas activă (normal pentru analytics / chat), dar textul s-a stabilizat' : ''}
+                ${r.console_errors?.length ? ` · ${r.console_errors.length} erori JavaScript` : ''}</p>
+               ${r.failed_requests?.length ? `<p class="muted">Requesturi eșuate (de obicei tracking, prefetch sau requesturi anulate — contează doar dacă sunt API-uri de conținut):</p>
+                <ul class="missing-list">${r.failed_requests.map(f => `<li class="muted">[${escapeHtml(f.type)}] ${escapeHtml(f.error || '')} — ${escapeHtml(f.url)}</li>`).join('')}</ul>` : ''}
+               ${r.console_errors?.length ? `<p class="muted">Erori JavaScript:</p><ul class="missing-list">${r.console_errors.map(e => `<li class="muted">${escapeHtml(e)}</li>`).join('')}</ul>` : ''}`
             : '<p class="muted" style="margin:-6px 0 12px">HTML randat lipit manual.</p>';
 
         panel.innerHTML = `
